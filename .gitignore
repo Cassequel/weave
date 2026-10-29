@@ -1,0 +1,7 @@
+.deps/
+.venv/
+__pycache__/
+*.pyc
+*.weave.json
+*.pes
+.pytest_cache/

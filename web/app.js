@@ -1,69 +1,58 @@
 const $ = id => document.getElementById(id);
-let source = null, raster = null, ratio = 1, result = null, sequence = 0, timer = null, threadColors = [];
-const controls = ['width','height','colors','background'];
-const settings = () => ({width:Number($('width').value), height:Number($('height').value), colors:Number($('colors').value), removeBackground:$('background').value === 'remove', threadColors});
-const status = message => $('status').textContent = message;
-function invalidate() { result = null; $('export').disabled = true; sequence++; }
-function download(blob, name) { const a = document.createElement('a'); const url = URL.createObjectURL(blob); a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
-function readFile(file) { return new Promise((resolve,reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = () => reject(new Error('Could not read this file.')); r.readAsDataURL(file); }); }
-function imageFrom(url) { return new Promise((resolve,reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error('Unable to open the image.')); image.src = url; }); }
-async function prepare(data, name, resetSize = true) {
-  if (data.length > 17 * 1024 * 1024) throw new Error('Image is too large (maximum 12 MB).');
-  let input = data;
-  if (/^data:image\/svg\+xml/i.test(data) || /\.svg$/i.test(name)) {
-    const encoded = data.split(',')[1];
-    const text = data.includes(';base64,') ? new TextDecoder().decode(Uint8Array.from(atob(encoded), c => c.charCodeAt(0))) : decodeURIComponent(encoded);
-    const doc = new DOMParser().parseFromString(text,'image/svg+xml');
-    if (doc.querySelector('parsererror, script, foreignObject, image, use, style') || /<!DOCTYPE|<!ENTITY|\b(?:href|src)\s*=|url\s*\(/i.test(text)) throw new Error('SVG must not contain scripts, external resources, or linked elements.');
-    input = URL.createObjectURL(new Blob([text],{type:'image/svg+xml'}));
-  }
-  let img;
-  try { img = await imageFrom(input); } finally { if (input.startsWith('blob:')) URL.revokeObjectURL(input); }
-  if (!img.naturalWidth || !img.naturalHeight || img.naturalWidth * img.naturalHeight > 20000000) throw new Error('Image must have dimensions under 20 million pixels.');
-  ratio = img.naturalWidth / img.naturalHeight;
-  const scale = Math.min(1, 1600 / Math.max(img.naturalWidth,img.naturalHeight));
-  const canvas = document.createElement('canvas'); canvas.width = Math.max(1,Math.round(img.naturalWidth*scale)); canvas.height = Math.max(1,Math.round(img.naturalHeight*scale));
-  canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);
-  raster = canvas.toDataURL('image/png'); source = {data,name};
-  if (resetSize) { $('width').value = Math.round(Math.min(100, 100*ratio)); $('height').value = Math.round(Number($('width').value)/ratio); }
-  $('filename').textContent = name; $('generate').disabled = false; $('save').disabled = false;
+let source=null, raster=null, original=null, prepared=null, preparedImage=null, result=null;
+let ratio=1, revision=0, loading=0, busy=false, job=null, view='source', threadColors=[], pan={x:0,y:0};
+const controls=['width','height','colors','palette','background','spacing','compensation'];
+const settings=()=>({width:+$('width').value,height:+$('height').value,colors:+$('colors').value,paletteMode:$('palette').value,removeBackground:$('background').value==='remove',spacing:+$('spacing').value,compensation:+$('compensation').value,threadColors:[...threadColors]});
+const status=text=>$('status').textContent=text;
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function api(path,body){let r;try{r=await fetch(path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch{throw Error('Weave is offline. Open start.bat, then reload this page.');}const data=await r.json();if(!r.ok)throw Error(data.error||'Request failed.');return data;}
+function download(blob,name){const a=document.createElement('a'),url=URL.createObjectURL(blob);a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+const readFile=file=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(Error('Could not read the file.'));r.readAsDataURL(file);});
+const imageFrom=url=>new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(Error('Unable to open the image.'));image.src=url;});
+function buttons(){ $('prepare').disabled=!raster||busy; $('generate').disabled=!prepared||busy; $('save').disabled=!source; $('export').disabled=!result||busy; $('svg').disabled=!prepared; $('cancel').hidden=!busy||!job;document.querySelector('[data-view="prepared"]').disabled=!prepared;document.querySelector('[data-view="stitches"]').disabled=!result; }
+function invalidate(message='Settings changed. Prepare the artwork again.'){revision++;if(job)api('/api/cancel',{jobId:job}).catch(()=>{});job=null;busy=false;prepared=null;preparedImage=null;result=null;view='source';$('warnings').replaceChildren();$('threads').replaceChildren();['size-stat','stitch-stat','thread-stat'].forEach(id=>$(id).textContent='—');buttons();draw();if(raster)status(message);}
+function showWarnings(warnings){$('warnings').replaceChildren(...warnings.map(text=>{const p=document.createElement('p');p.textContent='✳ '+text;return p;}));}
+function paletteControls(colors){$('palette-edit').replaceChildren(...colors.map((color,i)=>{const label=document.createElement('label');label.className='thread';const input=document.createElement('input');input.type='color';input.value=threadColors[i]||color;input.setAttribute('aria-label',`Thread ${i+1} color`);input.onchange=()=>{threadColors[i]=input.value;invalidate();};label.append(input,document.createTextNode(i===0&&$('palette').value==='navy-white'?'White thread':`Thread ${i+1}`));return label;}));}
+function syncPalette(){const auto=$('palette').value==='auto';$('auto-colors').hidden=!auto;$('color-value').textContent=`${$('colors').value} colors`;$('palette-hint').textContent=auto?'Colors will appear after preparation. Photos remain experimental.':'White is thread. Only the outside background is removed.';paletteControls(auto?[]:['#ffffff','#002e5d']);}
+async function loadImage(data,name,resetSize=true){
+ if(typeof data!=='string'||data.length>17*1024*1024)throw Error('Image is too large (maximum 12 MB).');
+ const loadId=++loading;let input=data,isSvg=/^data:image\/svg\+xml/i.test(data)||/\.svg$/i.test(name);
+ if(isSvg){const encoded=data.split(',')[1],text=data.includes(';base64,')?new TextDecoder().decode(Uint8Array.from(atob(encoded),c=>c.charCodeAt(0))):decodeURIComponent(encoded);const doc=new DOMParser().parseFromString(text,'image/svg+xml');if(doc.querySelector('parsererror,script,foreignObject,image,use,style')||/<!DOCTYPE|<!ENTITY|\b(?:href|src)\s*=|url\s*\(/i.test(text))throw Error('SVG must contain only standalone artwork without scripts or linked resources.');input=URL.createObjectURL(new Blob([text],{type:'image/svg+xml'}));}
+ let image;try{image=await imageFrom(input);}finally{if(input.startsWith('blob:'))URL.revokeObjectURL(input);}
+ if(loadId!==loading)return false;
+ if(!image.naturalWidth||!image.naturalHeight||image.naturalWidth*image.naturalHeight>20000000)throw Error('Image must be under 20 million pixels.');
+ let pixels=data;if(isSvg){const canvas=document.createElement('canvas');const scale=Math.min(2,2000/Math.max(image.naturalWidth,image.naturalHeight));canvas.width=Math.max(1,Math.round(image.naturalWidth*scale));canvas.height=Math.max(1,Math.round(image.naturalHeight*scale));canvas.getContext('2d').drawImage(image,0,0,canvas.width,canvas.height);pixels=canvas.toDataURL('image/png');}
+ invalidate();source={data,name};raster=pixels;original=image;ratio=image.naturalWidth/image.naturalHeight;pan={x:0,y:0};$('zoom').value=1;
+ if(resetSize){const w=Math.min(120,120*ratio);$('width').value=+w.toFixed(1);$('height').value=+(w/ratio).toFixed(1);}
+ $('filename').textContent=name;buttons();draw();status(isSvg?'SVG imported as pixels. Prepare artwork to create editable embroidery shapes.':'Image loaded. Prepare artwork, then inspect the white areas and fine details.');return true;
 }
-async function generate() {
-  if (!raster) return;
-  clearTimeout(timer); const current = ++sequence; result = null; $('export').disabled = true; status('Generating stitches…');
-  try {
-    const response = await fetch('/api/convert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:raster,settings:settings()})});
-    const data = await response.json(); if (!response.ok) throw new Error(data.error);
-    if (current !== sequence) return;
-    result = data; draw(); $('export').disabled = false; status('Preview ready. Review the notes before sewing.');
-  } catch (error) { if (current === sequence) status(error.message || 'Conversion failed.'); }
+async function prepareArtwork(){if(!raster||busy)return;invalidate();const current=++revision;busy=true;result=null;prepared=null;preparedImage=null;view='source';buttons();draw();status('Cleaning colors and tracing shapes…');
+ try{const data=await api('/api/prepare',{image:raster,settings:settings()});if(current!==revision)return;const img=await imageFrom('data:image/svg+xml;charset=utf-8,'+encodeURIComponent(data.svg));if(current!==revision)return;prepared=data;preparedImage=img;view='prepared';paletteControls(data.palette);showWarnings(data.warnings);$('thread-stat').textContent=`${data.regionCount} / ${data.palette.length}`;status('Shapes ready. Review the ears, lettering, white areas and whiskers, then generate stitches.');}
+ catch(e){if(current===revision)status(e.message);}finally{if(current===revision){busy=false;buttons();draw();}}
 }
-function draw() {
-  const canvas = $('preview'), ctx = canvas.getContext('2d'), w=canvas.width, h=canvas.height;
-  ctx.clearRect(0,0,w,h);
-  if (!result) return;
-  $('empty').hidden = true;
-  const landscape = result.width > 127;
-  const hoopW = landscape ? 177.8 : 127, hoopH = landscape ? 127 : 177.8;
-  const scale = Math.min((w-110)/hoopW,(h-100)/hoopH);
-  const left=(w-hoopW*scale)/2, top=(h-hoopH*scale)/2;
-  ctx.strokeStyle='#c9bfb0'; ctx.setLineDash([7,7]); ctx.lineWidth=1.5; ctx.strokeRect(left,top,hoopW*scale,hoopH*scale); ctx.setLineDash([]);
-  const ox=left+(hoopW-result.width)*scale/2, oy=top+(hoopH-result.height)*scale/2;
-  let previous=null;
-  for (const [x,y,cmd,color] of result.paths) {
-    const point=[ox+x*scale,oy+y*scale];
-    if (previous && cmd==='stitch') { ctx.strokeStyle=result.threads[color]; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(...previous); ctx.lineTo(...point); ctx.stroke(); }
-    else if (previous && cmd==='jump') { ctx.strokeStyle='#bcb5aa'; ctx.lineWidth=0.65; ctx.setLineDash([2,4]); ctx.beginPath(); ctx.moveTo(...previous); ctx.lineTo(...point); ctx.stroke(); ctx.setLineDash([]); }
-    previous=point;
-  }
-  $('size-stat').textContent=`${result.width} × ${result.height} mm`; $('stitch-stat').textContent=result.stitchCount.toLocaleString(); $('thread-stat').textContent=result.threads.length;
-  $('threads').replaceChildren(...result.threads.map((color,i) => { const el=document.createElement('label'); el.className='thread'; const swatch=document.createElement('input'); swatch.type='color'; swatch.value=color; swatch.setAttribute('aria-label',`Thread ${i+1} color`); swatch.addEventListener('change', () => { threadColors[i]=swatch.value; result.threads[i]=swatch.value; draw(); }); el.append(swatch, document.createTextNode(`${i+1} · ${color.toUpperCase()}`)); return el; }));
-  $('warnings').replaceChildren(...result.warnings.map(text => {const p=document.createElement('p'); p.textContent='✳  '+text; return p;}));
+async function generate(){if(!prepared||busy)return;const current=++revision;busy=true;result=null;view='prepared';$('size-stat').textContent='—';$('stitch-stat').textContent='—';$('threads').replaceChildren();showWarnings(prepared.warnings);buttons();draw();status('Starting Ink/Stitch…');const start=Date.now();
+ try{const data=await api('/api/jobs',{preparationId:prepared.preparationId});if(current!==revision){api('/api/cancel',{jobId:data.jobId}).catch(()=>{});return;}job=data.jobId;buttons();
+ while(current===revision){const state=await api('/api/jobs/'+job);if(current!==revision)return;if(state.status==='complete'){result=state.result;view='stitches';showWarnings(result.warnings);$('size-stat').textContent=`${result.width} × ${result.height} mm`;$('stitch-stat').textContent=`${result.stitchCount.toLocaleString()} / ${result.jumpCount.toLocaleString()}`;$('thread-stat').textContent=`${prepared.regionCount} / ${result.threads.length}`;$('threads').replaceChildren(...result.threads.map((color,i)=>{const el=document.createElement('span');el.className='thread';const sw=document.createElement('i');sw.style.background=color;el.append(sw,document.createTextNode(`${i+1} · ${color.toUpperCase()}`));return el;}));status('PES reopened and checked. Preview and download use this same file.');break;}if(state.status==='failed'||state.status==='cancelled')throw Error(state.error||'Conversion cancelled.');status(`${state.status==='queued'?'Waiting for Ink/Stitch':'Planning underlay and fill stitches'} · ${Math.floor((Date.now()-start)/1000)} s`);await wait(1000);}
+ }catch(e){if(current===revision)status(e.message);}finally{if(current===revision){busy=false;job=null;buttons();draw();}}
 }
-$('file').addEventListener('change',async event => { const file=event.target.files[0]; if (!file) return; invalidate(); threadColors=[]; try { if (file.size > 12*1024*1024) throw new Error('Image is too large (maximum 12 MB).'); if (!['image/png','image/jpeg','image/svg+xml'].includes(file.type) && !/\.(png|jpe?g|svg)$/i.test(file.name)) throw new Error('Choose a PNG, JPEG or SVG image.'); await prepare(await readFile(file),file.name); generate(); } catch(e) { source=null; raster=null; $('generate').disabled=true; $('save').disabled=true; status(e.message); } event.target.value=''; });
-$('lock').onclick=() => { const locked=$('lock').getAttribute('aria-pressed')!=='true'; $('lock').setAttribute('aria-pressed',String(locked)); $('lock').textContent=locked?'🔒':'🔓'; };
-for (const id of controls) $(id).addEventListener('input', () => { if (id==='width' && $('lock').getAttribute('aria-pressed')==='true') $('height').value=Math.max(1,Math.round(Number($('width').value)/ratio)); if (id==='height' && $('lock').getAttribute('aria-pressed')==='true') $('width').value=Math.max(1,Math.round(Number($('height').value)*ratio)); if(id==='colors' || id==='background') threadColors=[]; $('color-value').textContent=`${$('colors').value} COLORS`; invalidate(); clearTimeout(timer); if (raster) { status('Settings changed. Updating preview…'); timer=setTimeout(generate,400); } });
-$('generate').onclick=generate;
-$('save').onclick=() => { if (source) download(new Blob([JSON.stringify({version:1,source,settings:settings(),locked:$('lock').getAttribute('aria-pressed')==='true'})],{type:'application/json'}),'weave-project.weave.json'); };
-$('open-project').onchange=async event => { const file=event.target.files[0]; if (!file) return; invalidate(); try { if(file.size>18*1024*1024) throw new Error('Project is too large.'); const p=JSON.parse(await file.text()); if(p.version!==1 || !p.source || typeof p.source.data!=='string' || typeof p.source.name!=='string' || !p.settings) throw new Error('This is not a supported Weave project.'); await prepare(p.source.data,p.source.name,false); threadColors=Array.isArray(p.settings.threadColors)?p.settings.threadColors:[]; $('width').value=p.settings.width; $('height').value=p.settings.height; $('colors').value=p.settings.colors; $('background').value=p.settings.removeBackground?'remove':'keep'; $('color-value').textContent=`${$('colors').value} COLORS`; $('lock').setAttribute('aria-pressed',String(p.locked!==false)); $('lock').textContent=p.locked===false?'🔓':'🔒'; generate(); } catch(e) { source=null; raster=null; $('generate').disabled=true; $('save').disabled=true; status(e.message || 'Could not open project.'); } event.target.value=''; };
-$('export').onclick=async () => { if (!result) return; $('export').disabled=true; try { const response=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:raster,settings:settings()})}); if (!response.ok) {const e=await response.json(); throw new Error(e.error);} download(await response.blob(),'weave-design.pes'); status('PES downloaded. Test on scrap fabric before using your final item.'); } catch(e) {status(e.message);} finally { $('export').disabled=!result; } };
+function draw(){const canvas=$('preview'),ctx=canvas.getContext('2d'),w=canvas.width,h=canvas.height;ctx.clearRect(0,0,w,h);$('empty').hidden=!!original;document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.view===view)));$('zoom-value').textContent=Math.round(+$('zoom').value*100)+'%';if(!original)return;
+ const zoom=+$('zoom').value;ctx.save();ctx.translate(w/2+pan.x,h/2+pan.y);ctx.scale(zoom,zoom);
+ if(view==='stitches'&&result){const hw=result.width>127?177.8:127,hh=result.width>127?127:177.8,scale=Math.min((w-100)/hw,(h-90)/hh);ctx.strokeStyle='#8e9a91';ctx.setLineDash([5,5]);ctx.lineWidth=1/zoom;ctx.strokeRect(-hw*scale/2,-hh*scale/2,hw*scale,hh*scale);ctx.setLineDash([]);let prev=null,prevColor=null;for(const [x,y,cmd,color] of result.paths){const point=[(x-result.width/2)*scale,(y-result.height/2)*scale];if(prev&&cmd==='stitch'&&prevColor===color){ctx.strokeStyle=result.threads[color];ctx.lineWidth=.28*scale;ctx.beginPath();ctx.moveTo(...prev);ctx.lineTo(...point);ctx.stroke();}else if(prev&&cmd==='jump'&&$('jumps').checked){ctx.strokeStyle='#d47f48';ctx.lineWidth=.6/zoom;ctx.setLineDash([3,4]);ctx.beginPath();ctx.moveTo(...prev);ctx.lineTo(...point);ctx.stroke();ctx.setLineDash([]);}prev=point;prevColor=color;}$('view-caption').textContent=`Exact exported PES · ${result.trimCount} trim commands · ${result.jumpDistanceMm} mm travel · dashed border is the hoop.`;
+ }else{const image=view==='prepared'?preparedImage:original;if(image){const shapeRatio=view==='prepared'?prepared.width/prepared.height:ratio;let iw=w-80,ih=iw/shapeRatio;if(ih>h-70){ih=h-70;iw=ih*shapeRatio;}ctx.drawImage(image,-iw/2,-ih/2,iw,ih);}$('view-caption').textContent=view==='prepared'?`${prepared.regionCount} editable shapes · ${prepared.width} × ${prepared.height} mm artwork · white areas are thread; gray shows fabric.`:'Original artwork · drag to pan when zoomed in.';}
+ ctx.restore();
+}
+$('file').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{if(file.size>12*1024*1024)throw Error('Image is too large (maximum 12 MB).');if(!/\.(png|jpe?g|svg)$/i.test(file.name))throw Error('Choose PNG, JPEG or SVG.');threadColors=[];if(await loadImage(await readFile(file),file.name)){syncPalette();}}catch(err){status(err.message);}e.target.value='';};
+$('lock').onclick=()=>{const locked=$('lock').getAttribute('aria-pressed')!=='true';$('lock').setAttribute('aria-pressed',String(locked));$('lock').textContent=locked?'🔒':'🔓';};
+controls.forEach(id=>$(id).addEventListener('input',()=>{if($('lock').getAttribute('aria-pressed')==='true'){if(id==='width')$('height').value=+(+$('width').value/ratio).toFixed(1);if(id==='height')$('width').value=+(+$('height').value*ratio).toFixed(1);}if(id==='palette'||id==='colors'){threadColors=[];syncPalette();}invalidate();}));
+$('prepare').onclick=prepareArtwork;$('generate').onclick=generate;
+$('cancel').onclick=()=>{const saved=prepared,img=preparedImage;invalidate('Conversion cancelled. Your prepared artwork is still available.');prepared=saved;preparedImage=img;view='prepared';buttons();draw();};
+for(const button of document.querySelectorAll('[data-view]'))button.onclick=()=>{view=button.dataset.view;pan={x:0,y:0};draw();};
+$('zoom').oninput=draw;$('jumps').onchange=draw;$('reset-view').onclick=()=>{$('zoom').value=1;pan={x:0,y:0};draw();};
+let drag=null;$('preview').onpointerdown=e=>{if(+$('zoom').value<=1)return;drag={x:e.clientX,y:e.clientY,pan:{...pan}};e.target.setPointerCapture(e.pointerId);};$('preview').onpointermove=e=>{if(!drag)return;const rect=e.target.getBoundingClientRect();pan={x:drag.pan.x+(e.clientX-drag.x)*e.target.width/rect.width,y:drag.pan.y+(e.clientY-drag.y)*e.target.height/rect.height};draw();};$('preview').onpointerup=$('preview').onpointercancel=()=>drag=null;
+$('save').onclick=()=>{if(source)download(new Blob([JSON.stringify({version:2,source,settings:settings(),locked:$('lock').getAttribute('aria-pressed')==='true',engine:'Ink/Stitch 3.3.0'})],{type:'application/json'}),'weave-project.weave.json');};
+$('open-project').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{if(file.size>18*1024*1024)throw Error('Project is too large.');const p=JSON.parse(await file.text());if(![1,2].includes(p.version)||!p.source||typeof p.source.data!=='string'||typeof p.source.name!=='string'||!p.settings)throw Error('This is not a supported Weave project.');if(!await loadImage(p.source.data,p.source.name,false))return;const s=p.settings;for(const id of ['width','height','colors'])$(id).value=s[id];$('spacing').value=s.spacing??.45;$('compensation').value=s.compensation??.15;$('palette').value=s.paletteMode||(p.version===1?'auto':'navy-white');$('background').value=s.removeBackground?'remove':'keep';threadColors=Array.isArray(s.threadColors)?s.threadColors:[];const locked=p.locked!==false;$('lock').setAttribute('aria-pressed',String(locked));$('lock').textContent=locked?'🔒':'🔓';syncPalette();invalidate('Project restored. Prepare artwork to regenerate with the current engine.');}catch(err){status(err.message||'Could not open project.');}e.target.value='';};
+async function downloadExport(path,name){const r=await fetch(path);if(!r.ok){const error=await r.json();throw Error(error.error);}download(await r.blob(),name);}
+$('export').onclick=async()=>{if(!result)return;try{await downloadExport('/api/designs/'+result.designId+'.pes','weave-design.pes');status('PES downloaded. Check it on the machine and test on stabilized scrap fabric.');}catch(e){status(e.message);}};
+$('svg').onclick=async()=>{if(!prepared)return;try{await downloadExport('/api/prepared/'+prepared.preparationId+'.svg','weave-artwork.svg');}catch(e){status(e.message);}};
+syncPalette();
+(async()=>{try{const health=await api('/api/health');$('engine-label').textContent=health.available?health.engine:'SETUP NEEDED';const startup=await api('/api/startup-image');if(startup&&!source)await loadImage(startup.data,startup.name);if(!health.available)status('Run setup.ps1 to install Ink/Stitch before generating stitches.');}catch(e){status(e.message);}})();

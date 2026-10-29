@@ -1,3 +1,6 @@
 Pillow>=10,<13
-numpy>=1.24,<3
+numpy>=1.26,<3
 pyembroidery==1.5.1
+scipy==1.17.1
+vtracer==0.6.15
+shapely==2.1.2
